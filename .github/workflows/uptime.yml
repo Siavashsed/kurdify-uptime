@@ -111,7 +111,9 @@ jobs:
     # workflow RUN does not count as activity. Without this the monitor dies silently after
     # two months, which is the exact class of failure it was built to catch. One commit a
     # week is the cheapest thing that counts as activity.
-    if: github.event_name == 'schedule'
+    # Dispatch included so this job can be exercised on demand. It is safe to run often: the
+    # 7-day age gate below, not the trigger, is what bounds how many commits it makes.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
