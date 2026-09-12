@@ -1,0 +1,136 @@
+# Off-machine reachability check for Kurdify.
+#
+# WHY THIS REPO EXISTS AT ALL, AND WHY IT IS PUBLIC.
+# The on-host probe (kurdify/ops/kurdify-healthcheck.sh) runs on the same Mac that serves the
+# site. 143 of its 249 recorded failures were the host itself unreachable, which an on-host
+# probe structurally cannot report: the machine that is down cannot tell you it is down. This
+# runs on GitHub's infrastructure, so it survives the thing it is watching.
+# It is a SEPARATE PUBLIC repo, not a workflow inside Siavashsed/kurdify, because that repo is
+# private and private-repo Actions bill per run rounded up to the minute: a 5-minute cron is
+# 8,640 billed minutes/month against a 2,000-3,000 allowance, roughly $53/month. Public repos
+# get unlimited free minutes. Nothing here is secret; app.kurdify.app is already public DNS.
+#
+# HOW YOU FIND OUT. GitHub emails the user who last edited the cron when a SCHEDULED workflow
+# fails. That is the baseline channel and it needs no configuration. The Telegram step below
+# is additive and stays silent until the secrets exist.
+#
+# Copyright (c) Kavalsia Inc. All Rights Reserved.
+# Lead Architect & Engineer: Siavash Sadighi
+
+name: uptime
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub treats cron as best-effort and delays scheduled runs under load,
+    # sometimes by 10-15 minutes. Treat this as "checked several times an hour", never as a
+    # precise interval, and never as the source of an uptime percentage.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# A late run must never pile up behind a running one.
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe public endpoints
+        id: probe
+        env:
+          # Two probes, not one, matching the on-host script: /api/features proves the app is
+          # answering, / proves the page a visitor actually lands on still renders. They fail
+          # independently, so a wedged data path can leave one fine and the other broken.
+          API_URL: https://app.kurdify.app/api/features
+          HOME_URL: https://app.kurdify.app/
+        run: |
+          set -uo pipefail
+
+          # One retry, 20s apart, before calling it an outage. The on-host script requires two
+          # consecutive 5-minute ticks for the same reason, but that costs it 5 minutes of
+          # detection latency. Retrying inside one run buys the same protection against a
+          # single dropped request for 20 seconds instead.
+          # `var=$(curl ...) || var=000`, never `$(curl ... || echo 000)`: with -w the failing
+          # curl ALREADY prints 000, so the piped fallback would append a second one and the
+          # code would read "000000" and match nothing downstream.
+          probe() {
+            local url="$1" code
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url") || code=000
+            if [ "$code" = "200" ]; then echo "$code"; return 0; fi
+            sleep 20
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url") || code=000
+            echo "$code"
+            [ "$code" = "200" ]
+          }
+
+          api=$(probe "$API_URL");  api_ok=$?
+          home=$(probe "$HOME_URL"); home_ok=$?
+
+          echo "api=$api home=$home"
+          {
+            echo "api=$api"
+            echo "home=$home"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ $api_ok -ne 0 ] || [ $home_ok -ne 0 ]; then
+            echo "::error::Kurdify unreachable from off-host: api=$api home=$home"
+            exit 1
+          fi
+          echo "Kurdify reachable: api=$api home=$home"
+
+      - name: Telegram alert
+        # Runs only when the probe failed. Stays silent, and green, until the secrets exist,
+        # so a missing alert channel never turns into a second failure on top of the first.
+        if: failure()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_ALERT_CHAT: ${{ secrets.TG_ALERT_CHAT }}
+          # Not HOME: that is the shell's own home-directory variable, and clobbering it in a
+          # step env breaks anything that resolves a path from it.
+          API_CODE: ${{ steps.probe.outputs.api }}
+          HOME_CODE: ${{ steps.probe.outputs.home }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_ALERT_CHAT:-}" ]; then
+            echo "No Telegram secrets set; GitHub's own failure email is the only channel."
+            exit 0
+          fi
+          curl -s --max-time 15 \
+            -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d "{\"chat_id\":\"${TG_ALERT_CHAT}\",\"text\":\"Kurdify DOWN from off-host. /api/features=${API_CODE} /=${HOME_CODE}\"}" \
+            -o /dev/null -w 'telegram=%{http_code}\n' || true
+
+  keepalive:
+    # GitHub DISABLES scheduled workflows in a repo with no activity for 60 days, and a
+    # workflow RUN does not count as activity. Without this the monitor dies silently after
+    # two months, which is the exact class of failure it was built to catch. One commit a
+    # week is the cheapest thing that counts as activity.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch heartbeat once a week
+        run: |
+          set -euo pipefail
+          last=$(cat .heartbeat 2>/dev/null || echo 0)
+          now=$(date -u +%s)
+          if [ $((now - last)) -lt 604800 ]; then
+            echo "Heartbeat is $((now - last))s old, under 7 days. Nothing to do."
+            exit 0
+          fi
+          echo "$now" > .heartbeat
+          date -u '+%Y-%m-%d %H:%M:%S UTC' > .heartbeat-readable
+          git config user.name  'Kavalsia Inc.'
+          git config user.email 'sia@kavalsia.com'
+          git add .heartbeat .heartbeat-readable
+          git commit -m 'chore: heartbeat, keeps the scheduled monitor enabled'
+          git push
